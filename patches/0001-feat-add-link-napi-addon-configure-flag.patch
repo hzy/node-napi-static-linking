@@ -1,0 +1,228 @@
+From 387375df6abff64294d1ef486fe2dde21ccc08c4 Mon Sep 17 00:00:00 2001
+From: Zhiyuan Hong <hongzhiyuan.hzy@bytedance.com>
+Date: Thu, 16 Apr 2026 14:58:02 +0800
+Subject: [PATCH] feat: add --link-napi-addon configure flag
+
+Add support for statically linking NAPI addons into the Node.js binary
+as linked bindings, accessible via process._linkedBinding('name').
+
+Usage:
+  ./configure --link-napi-addon name:/path/to/libaddon.a
+
+The configure step automatically:
+  1. Copies each .a to a staging directory (out/linked_napi_addons/)
+  2. Uses objcopy --redefine-sym to give each addon unique symbols
+     (resolves napi_register_module_v1 collisions across multiple addons)
+  3. Generates a C++ wrapper that registers all addons via NODE_C_CTOR
+
+Changes:
+  - configure.py: new --link-napi-addon flag + processing logic
+  - node.gyp: new variables linked_napi_addon_sources/libs
+  - tools/link_napi_addons.py: new script (objcopy + codegen)
+---
+ configure.py              |  29 ++++++++++
+ node.gyp                  |   7 +++
+ tools/link_napi_addons.py | 112 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 148 insertions(+)
+ create mode 100755 tools/link_napi_addons.py
+
+diff --git a/configure.py b/configure.py
+index f7fababe..fa0cd319 100755
+--- a/configure.py
++++ b/configure.py
+@@ -226,6 +226,15 @@ parser.add_argument("--link-module",
+          "e.g. /root/x/y.js will be referenced via require('root/x/y'). "
+          "Can be used multiple times")
+ 
++parser.add_argument("--link-napi-addon",
++    action="append",
++    dest="linked_napi_addons",
++    help="Statically link a NAPI addon into the binary as a linked binding. "
++         "Format: name:/path/to/libaddon.a  "
++         "The addon becomes available via process._linkedBinding('name'). "
++         "The .a must export the standard napi_register_module_v1 symbol. "
++         "Can be used multiple times for multiple addons.")
++
+ parser.add_argument("--openssl-conf-name",
+     action="store",
+     dest="openssl_conf_name",
+@@ -1895,6 +1904,26 @@ def configure_node(o):
+   if options.linked_module:
+     o['variables']['linked_module_files'] = options.linked_module
+ 
++  o["variables"]["linked_napi_addon_sources"] = []
++  o["variables"]["linked_napi_addon_libs"] = []
++  if options.linked_napi_addons:
++    staging = os.path.join(os.getcwd(), "out", "linked_napi_addons")
++    tool = os.path.join(os.getcwd(), "tools", "link_napi_addons.py")
++    cmd = [sys.executable, tool, "--output-dir", staging] + options.linked_napi_addons
++    print_verbose(" ".join(cmd))
++    proc = subprocess.run(cmd, capture_output=True, text=True)
++    if proc.returncode != 0:
++      error("link_napi_addons.py failed:\n" + proc.stderr)
++    for line in proc.stdout.splitlines():
++      if line.startswith("WRAPPER:"):
++        abspath = line[len("WRAPPER:"):]
++        o["variables"]["linked_napi_addon_sources"].append(
++            os.path.relpath(abspath, os.getcwd()))
++      elif line.startswith("LIB:"):
++        o["variables"]["linked_napi_addon_libs"].append(line[len("LIB:"):])
++    names = [s.split(":")[0] for s in options.linked_napi_addons]
++    print("Linked NAPI addons: " + ", ".join(names))
++
+   o['variables']['asan'] = int(options.enable_asan or 0)
+   o['variables']['ubsan'] = int(options.enable_ubsan or 0)
+ 
+diff --git a/node.gyp b/node.gyp
+index bd77943b..f079d59a 100644
+--- a/node.gyp
++++ b/node.gyp
+@@ -10,6 +10,8 @@
+     'node_enable_v8_vtunejit%': 'false',
+     'node_intermediate_lib_type%': 'static_library',
+     'node_lib_target_name%': 'libnode',
++    'linked_napi_addon_sources%': [],
++    'linked_napi_addon_libs%': [],
+     'node_module_version%': '',
+     'node_no_browser_globals%': 'false',
+     'node_shared_brotli%': 'false',
+@@ -589,6 +591,10 @@
+         'src/node_main.cc'
+       ],
+ 
++      'libraries': [
++        '<@(linked_napi_addon_libs)',
++      ],
++
+       'msvs_settings': {
+         'VCLinkerTool': {
+           'GenerateMapFile': 'true', # /MAP
+@@ -902,6 +908,7 @@
+ 
+       'sources': [
+         '<@(node_sources)',
++        '<@(linked_napi_addon_sources)',
+         # Dependency headers
+         'deps/v8/include/v8.h',
+         'deps/postject/postject-api.h',
+diff --git a/tools/link_napi_addons.py b/tools/link_napi_addons.py
+new file mode 100755
+index 00000000..2053cc6a
+--- /dev/null
++++ b/tools/link_napi_addons.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""Generate linked-binding wrapper for statically-linked NAPI addons.
++
++For each addon specified as name:path, this script:
++  1. Copies the .a to a staging directory
++  2. Runs objcopy --redefine-sym to give each addon unique symbols
++  3. Generates a C++ file that registers them as Node.js linked bindings
++
++Called by configure.py when --link-napi-addon is used.
++"""
++
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output-dir", required=True)
++    parser.add_argument("addons", nargs="+", help="name:/path/to/lib.a")
++    args = parser.parse_args()
++
++    output_dir = os.path.abspath(args.output_dir)
++    os.makedirs(output_dir, exist_ok=True)
++
++    addons = []
++    for spec in args.addons:
++        if ":" not in spec:
++            print(f"ERROR: expected name:/path, got: {spec}", file=sys.stderr)
++            sys.exit(1)
++        name, path = spec.split(":", 1)
++        path = os.path.abspath(path)
++        if not os.path.isfile(path):
++            print(f"ERROR: file not found: {path}", file=sys.stderr)
++            sys.exit(1)
++        addons.append((name, path))
++
++    lib_paths = []
++    for name, src in addons:
++        dst = os.path.join(output_dir, f"lib_napi_{name}.a")
++        shutil.copy2(src, dst)
++        subprocess.check_call(
++            [
++                "objcopy",
++                "--redefine-sym",
++                f"napi_register_module_v1=napi_register_module_v1__{name}",
++                "--redefine-sym",
++                f"node_api_module_get_api_version_v1=node_api_module_get_api_version_v1__{name}",
++                dst,
++            ]
++        )
++        lib_paths.append(dst)
++
++    wrapper = os.path.join(output_dir, "linked_napi_addons.cc")
++    _generate(wrapper, addons)
++
++    # Machine-readable output consumed by configure.py
++    print(f"WRAPPER:{wrapper}")
++    for p in lib_paths:
++        print(f"LIB:{p}")
++
++
++def _generate(path, addons):
++    """Emit the C++ wrapper that registers every addon."""
++    w = []
++    w.append("// AUTO-GENERATED by tools/link_napi_addons.py — do not edit.")
++    w.append('#include "node_binding.h"')
++    w.append("")
++
++    for name, _ in addons:
++        w.append(f'extern "C" napi_value napi_register_module_v1__{name}(')
++        w.append(f"    napi_env env, napi_value exports);")
++    w.append("")
++
++    for name, _ in addons:
++        w.append(f"static void LinkedNapiInit_{name}(")
++        w.append(f"    v8::Local<v8::Object> exports,")
++        w.append(f"    v8::Local<v8::Value> module,")
++        w.append(f"    v8::Local<v8::Context> context,")
++        w.append(f"    void*) {{")
++        w.append(f"  napi_module_register_by_symbol(")
++        w.append(f"      exports, module, context,")
++        w.append(f"      napi_register_module_v1__{name},")
++        w.append(f"      NODE_API_DEFAULT_MODULE_API_VERSION);")
++        w.append(f"}}")
++        w.append("")
++
++    for name, _ in addons:
++        w.append(f"static node::node_module linked_napi_module_{name} = {{")
++        w.append(f"    NODE_MODULE_VERSION,")
++        w.append(f"    node::ModuleFlags::kLinked,")
++        w.append(f"    nullptr, __FILE__, nullptr,")
++        w.append(f"    LinkedNapiInit_{name},")
++        w.append(f'    "{name}",')
++        w.append(f"    nullptr, nullptr,")
++        w.append(f"}};")
++        w.append("")
++
++    w.append("NODE_C_CTOR(register_linked_napi_addons) {")
++    for name, _ in addons:
++        w.append(f"  node_module_register(&linked_napi_module_{name});")
++    w.append("}")
++    w.append("")
++
++    with open(path, "w") as f:
++        f.write("\n".join(w))
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.39.5
+

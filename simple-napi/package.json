@@ -1,0 +1,17 @@
+{
+  "name": "simple-napi",
+  "version": "1.0.0",
+  "description": "A simple Node.js N-API addon using node-gyp and C++",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "build:debug": "node-gyp rebuild --debug",
+    "clean": "node-gyp clean",
+    "test": "node test.js"
+  },
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^8.0.0"
+  },
+  "license": "MIT"
+}

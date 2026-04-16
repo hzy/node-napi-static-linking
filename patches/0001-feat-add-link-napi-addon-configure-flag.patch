@@ -1,4 +1,4 @@
-From 387375df6abff64294d1ef486fe2dde21ccc08c4 Mon Sep 17 00:00:00 2001
+From 183812ac8a67539799240f431bb108297aabc16b Mon Sep 17 00:00:00 2001
 From: Zhiyuan Hong <hongzhiyuan.hzy@bytedance.com>
 Date: Thu, 16 Apr 2026 14:58:02 +0800
 Subject: [PATCH] feat: add --link-napi-addon configure flag
@@ -20,10 +20,10 @@ Changes:
   - node.gyp: new variables linked_napi_addon_sources/libs
   - tools/link_napi_addons.py: new script (objcopy + codegen)
 ---
- configure.py              |  29 ++++++++++
- node.gyp                  |   7 +++
- tools/link_napi_addons.py | 112 ++++++++++++++++++++++++++++++++++++++
- 3 files changed, 148 insertions(+)
+ configure.py              |  29 +++++++
+ node.gyp                  |   7 ++
+ tools/link_napi_addons.py | 175 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 211 insertions(+)
  create mode 100755 tools/link_napi_addons.py
 
 diff --git a/configure.py b/configure.py
@@ -107,43 +107,105 @@ index bd77943b..f079d59a 100644
          'deps/postject/postject-api.h',
 diff --git a/tools/link_napi_addons.py b/tools/link_napi_addons.py
 new file mode 100755
-index 00000000..2053cc6a
+index 00000000..a5afbb9d
 --- /dev/null
 +++ b/tools/link_napi_addons.py
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,175 @@
 +#!/usr/bin/env python3
 +"""Generate linked-binding wrapper for statically-linked NAPI addons.
 +
 +For each addon specified as name:path, this script:
-+  1. Copies the .a to a staging directory
-+  2. Runs objcopy --redefine-sym to give each addon unique symbols
++  1. Copies the .a/.lib to a staging directory
++  2. Runs objcopy/llvm-objcopy --redefine-sym to give each addon unique symbols
 +  3. Generates a C++ file that registers them as Node.js linked bindings
 +
 +Called by configure.py when --link-napi-addon is used.
++
++On Windows, llvm-objcopy from the Visual Studio LLVM toolchain is used.
++On Linux/macOS, GNU objcopy (or llvm-objcopy if available) is used.
 +"""
 +
 +import argparse
 +import os
++import platform
 +import shutil
 +import subprocess
 +import sys
 +
 +
++def _find_objcopy():
++    """Find an objcopy binary that supports --redefine-sym."""
++    is_win = platform.system() == "Windows"
++
++    if is_win:
++        # Node.js v24+ requires ClangCL, so LLVM is always installed.
++        # llvm-objcopy is in the same directory as clang-cl.exe.
++        # Check VCINSTALLDIR first (set by vcvarsall.bat / vcbuild.bat).
++        vcinstalldir = os.environ.get("VCINSTALLDIR", "")
++        if vcinstalldir:
++            candidate = os.path.join(vcinstalldir, "Tools", "Llvm", "x64", "bin", "llvm-objcopy.exe")
++            if os.path.isfile(candidate):
++                return candidate
++
++        # Fallback: try PATH
++        for name in ("llvm-objcopy", "llvm-objcopy.exe"):
++            path = shutil.which(name)
++            if path:
++                return path
++
++        print(
++            "ERROR: llvm-objcopy not found. Install Visual Studio with the C++ Clang tools, or add llvm-objcopy to PATH.",
++            file=sys.stderr,
++        )
++        sys.exit(1)
++    else:
++        # Linux / macOS: prefer objcopy, fall back to llvm-objcopy
++        for name in ("objcopy", "llvm-objcopy"):
++            path = shutil.which(name)
++            if path:
++                return path
++
++        print(
++            "ERROR: neither objcopy nor llvm-objcopy found. Install binutils or llvm.",
++            file=sys.stderr,
++        )
++        sys.exit(1)
++
++
 +def main():
 +    parser = argparse.ArgumentParser()
 +    parser.add_argument("--output-dir", required=True)
-+    parser.add_argument("addons", nargs="+", help="name:/path/to/lib.a")
++    parser.add_argument("addons", nargs="+", help="name:/path/to/lib.a or name:/path/to/lib.lib")
 +    args = parser.parse_args()
 +
 +    output_dir = os.path.abspath(args.output_dir)
 +    os.makedirs(output_dir, exist_ok=True)
 +
++    is_win = platform.system() == "Windows"
++    objcopy = _find_objcopy()
++    print(f"Using objcopy: {objcopy}", file=sys.stderr)
++
 +    addons = []
 +    for spec in args.addons:
-+        if ":" not in spec:
++        # Format: name:/path/to/lib.a  or  name:C:\path\to\lib.lib
++        # split(":", 1) gives ["name", "/path/..."] or ["name", "C:\path\..."].
++        # On Windows the path part may start with a drive letter like "C:\",
++        # which itself contains ":". Handle this: if the path part is a single
++        # letter followed by ":\", rejoin with the next split.
++        parts = spec.split(":", 1)
++        if len(parts) != 2 or not parts[0]:
 +            print(f"ERROR: expected name:/path, got: {spec}", file=sys.stderr)
 +            sys.exit(1)
-+        name, path = spec.split(":", 1)
++        name, path = parts
++        # Check if we accidentally split a Windows drive letter:
++        # name="simple_napi", path="C" won't happen since split(":", 1) yields
++        # the full remainder. But if name itself looks like a single drive
++        # letter (e.g. spec="C:\foo"), that means no name was provided.
++        # In practice addon names must be valid C identifiers (len > 1), so
++        # a single-char name that equals a drive letter is rejected.
++        if len(name) == 1 and name.isalpha() and path.startswith(("\\", "/")):
++            print(f"ERROR: addon name cannot be a single letter (conflicts with drive letters): {spec}", file=sys.stderr)
++            sys.exit(1)
 +        path = os.path.abspath(path)
 +        if not os.path.isfile(path):
 +            print(f"ERROR: file not found: {path}", file=sys.stderr)
@@ -152,11 +214,12 @@ index 00000000..2053cc6a
 +
 +    lib_paths = []
 +    for name, src in addons:
-+        dst = os.path.join(output_dir, f"lib_napi_{name}.a")
++        ext = ".lib" if is_win else ".a"
++        dst = os.path.join(output_dir, f"lib_napi_{name}{ext}")
 +        shutil.copy2(src, dst)
 +        subprocess.check_call(
 +            [
-+                "objcopy",
++                objcopy,
 +                "--redefine-sym",
 +                f"napi_register_module_v1=napi_register_module_v1__{name}",
 +                "--redefine-sym",

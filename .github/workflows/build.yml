@@ -37,3 +37,36 @@ jobs:
         with:
           name: node-linux-x64
           path: build/node
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git identity (needed by git am)
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@localhost"
+
+      - name: Install NASM
+        run: choco install nasm -y
+
+      - name: Build
+        run: .\build.ps1
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-win-x64
+          path: build/node.exe

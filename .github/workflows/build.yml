@@ -19,6 +19,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: Configure git identity (needed by git am)
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@localhost"
+
       - name: Install build dependencies
         run: |
           sudo apt-get update

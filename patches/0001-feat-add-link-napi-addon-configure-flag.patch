@@ -1,4 +1,4 @@
-From e2581dc4fef995cab983b007f2a9ed7cfeb4fbb1 Mon Sep 17 00:00:00 2001
+From bac207505aabe97884fbe872fd143bf290d03d5b Mon Sep 17 00:00:00 2001
 From: Zhiyuan Hong <hongzhiyuan.hzy@bytedance.com>
 Date: Thu, 16 Apr 2026 14:58:02 +0800
 Subject: [PATCH] feat: add --link-napi-addon configure flag
@@ -22,9 +22,9 @@ Changes:
 ---
  configure.py               |  29 ++++
  node.gyp                   |   7 +
- tools/coff_redefine_sym.py | 313 +++++++++++++++++++++++++++++++++++++
- tools/link_napi_addons.py  | 157 +++++++++++++++++++
- 4 files changed, 506 insertions(+)
+ tools/coff_redefine_sym.py | 336 +++++++++++++++++++++++++++++++++++++
+ tools/link_napi_addons.py  | 157 +++++++++++++++++
+ 4 files changed, 529 insertions(+)
  create mode 100644 tools/coff_redefine_sym.py
  create mode 100755 tools/link_napi_addons.py
 
@@ -109,10 +109,10 @@ index bd77943b..f079d59a 100644
          'deps/postject/postject-api.h',
 diff --git a/tools/coff_redefine_sym.py b/tools/coff_redefine_sym.py
 new file mode 100644
-index 00000000..04eb1e54
+index 00000000..ca3672b0
 --- /dev/null
 +++ b/tools/coff_redefine_sym.py
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,336 @@
 +#!/usr/bin/env python3
 +"""Rename symbols in a COFF static library (.lib) file.
 +
@@ -390,11 +390,34 @@ index 00000000..04eb1e54
 +
 +    members = _parse_archive(data)
 +
++    renamed_count = 0
 +    # Rename in each obj member (skip linker members and longnames)
 +    for i, m in enumerate(members):
 +        if m["name"] in (b"/", b"//"):
 +            continue
++        old_body = bytes(m["body"])
 +        m["body"] = _coff_rename_symbols(m["body"], renames_bytes)
++        if m["body"] != old_body:
++            renamed_count += 1
++            print(f"  [coff] renamed symbols in member {i} ({m['name']})", file=sys.stderr)
++
++    if renamed_count == 0:
++        print(f"  [coff] WARNING: no symbols were renamed in {lib_path}", file=sys.stderr)
++        for i, m in enumerate(members):
++            if m["name"] in (b"/", b"//"):
++                continue
++            body = m["body"]
++            if len(body) >= 20:
++                machine = struct.unpack_from("<H", body, 0)[0]
++                sym_off = struct.unpack_from("<I", body, 8)[0]
++                num_sym = struct.unpack_from("<I", body, 12)[0]
++                strtab_off = sym_off + num_sym * 18
++                print(
++                    f"    member {i}: name={m['name']} size={len(body)} machine=0x{machine:04x} sym_off={sym_off} num_sym={num_sym} strtab_off={strtab_off}",
++                    file=sys.stderr,
++                )
++            else:
++                print(f"    member {i}: name={m['name']} size={len(body)} (too small)", file=sys.stderr)
 +
 +    # Rebuild the archive (regenerates linker members with new symbol names)
 +    new_data = _build_archive(members)

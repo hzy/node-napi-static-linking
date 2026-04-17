@@ -1,4 +1,4 @@
-From 183812ac8a67539799240f431bb108297aabc16b Mon Sep 17 00:00:00 2001
+From a5bc1176f4cedca8d8f2c767df2d9ad1f826da35 Mon Sep 17 00:00:00 2001
 From: Zhiyuan Hong <hongzhiyuan.hzy@bytedance.com>
 Date: Thu, 16 Apr 2026 14:58:02 +0800
 Subject: [PATCH] feat: add --link-napi-addon configure flag
@@ -20,10 +20,12 @@ Changes:
   - node.gyp: new variables linked_napi_addon_sources/libs
   - tools/link_napi_addons.py: new script (objcopy + codegen)
 ---
- configure.py              |  29 +++++++
- node.gyp                  |   7 ++
- tools/link_napi_addons.py | 175 ++++++++++++++++++++++++++++++++++++++
- 3 files changed, 211 insertions(+)
+ configure.py               |  29 ++++
+ node.gyp                   |   7 +
+ tools/coff_redefine_sym.py | 304 +++++++++++++++++++++++++++++++++++++
+ tools/link_napi_addons.py  | 157 +++++++++++++++++++
+ 4 files changed, 497 insertions(+)
+ create mode 100644 tools/coff_redefine_sym.py
  create mode 100755 tools/link_napi_addons.py
 
 diff --git a/configure.py b/configure.py
@@ -105,24 +107,334 @@ index bd77943b..f079d59a 100644
          # Dependency headers
          'deps/v8/include/v8.h',
          'deps/postject/postject-api.h',
+diff --git a/tools/coff_redefine_sym.py b/tools/coff_redefine_sym.py
+new file mode 100644
+index 00000000..576feb5b
+--- /dev/null
++++ b/tools/coff_redefine_sym.py
+@@ -0,0 +1,304 @@
++#!/usr/bin/env python3
++"""Rename symbols in a COFF static library (.lib) file.
++
++Pure-Python implementation of `objcopy --redefine-sym` for COFF archives.
++This is needed on Windows where GNU objcopy is unavailable and llvm-objcopy
++does not support COFF .lib files.
++
++Usage:
++  python coff_redefine_sym.py old1=new1 old2=new2 file.lib
++
++The file is modified in-place.
++"""
++
++import struct
++import sys
++
++ARCHIVE_MAGIC = b"!<arch>\n"
++MEMBER_HDR_SIZE = 60
++
++
++# ─── archive parsing ─────────────────────────────────────────────────
++
++
++def _parse_archive(data):
++    """Parse a COFF archive into a list of (header_dict, body_bytes)."""
++    assert data[:8] == ARCHIVE_MAGIC, "not a COFF archive"
++    pos = 8
++    members = []
++    while pos < len(data):
++        hdr_raw = data[pos : pos + MEMBER_HDR_SIZE]
++        name = hdr_raw[0:16].rstrip(b" ")
++        size = int(hdr_raw[48:58].strip())
++        body = data[pos + MEMBER_HDR_SIZE : pos + MEMBER_HDR_SIZE + size]
++        members.append({"name": name, "hdr_raw": hdr_raw, "body": bytearray(body)})
++        pos += MEMBER_HDR_SIZE + size
++        if pos % 2:
++            pos += 1  # 2-byte alignment
++    return members
++
++
++def _build_archive(members):
++    """Reassemble an archive from members, rebuilding linker members."""
++    # Identify the linker members (name = b"/") and longnames (b"//").
++    # Members 0 and 1 are linker members, the rest are obj + longnames.
++    obj_members = []
++    longnames_member = None
++    for i, m in enumerate(members):
++        if i < 2 and m["name"] == b"/":
++            continue  # skip old linker members — we rebuild them
++        elif m["name"] == b"//":
++            longnames_member = m
++        else:
++            obj_members.append(m)
++
++    # Scan all obj members for their exported symbols.
++    obj_symbols = []  # list of (member_index, symbol_name_bytes)
++    for idx, m in enumerate(obj_members):
++        for sym_name in _coff_get_external_symbols(m["body"]):
++            obj_symbols.append((idx, sym_name))
++
++    # We'll compute file offsets in two passes.
++    # First, compute sizes of linker members, then lay everything out.
++
++    # ── first linker member (big-endian) ──
++    num_sym = len(obj_symbols)
++    # placeholder offsets — will fill after layout
++    first_strings = b"".join(s + b"\0" for _, s in obj_symbols)
++    first_body_size = 4 + 4 * num_sym + len(first_strings)
++
++    # ── second linker member (little-endian, sorted) ──
++    num_members = len(obj_members)
++    sorted_syms = sorted(enumerate(obj_symbols), key=lambda x: x[1][1].lower())
++    second_strings = b"".join(s + b"\0" for _, (_, s) in sorted_syms)
++    second_body_size = 4 + 4 * num_members + 4 + 2 * num_sym + len(second_strings)
++
++    def _member_block_size(body_len):
++        s = MEMBER_HDR_SIZE + body_len
++        if s % 2:
++            s += 1
++        return s
++
++    # Compute offsets
++    offset = 8  # after signature
++    first_member_offset = offset
++    offset += _member_block_size(first_body_size)
++    second_member_offset = offset
++    offset += _member_block_size(second_body_size)
++
++    if longnames_member:
++        longnames_offset = offset
++        offset += _member_block_size(len(longnames_member["body"]))
++
++    obj_offsets = []
++    for m in obj_members:
++        obj_offsets.append(offset)
++        offset += _member_block_size(len(m["body"]))
++
++    # Now build first linker member body
++    first_body = struct.pack(">I", num_sym)
++    for orig_idx, _ in obj_symbols:
++        first_body += struct.pack(">I", obj_offsets[orig_idx])
++    first_body += first_strings
++
++    # Build second linker member body
++    second_body = struct.pack("<I", num_members)
++    for off in obj_offsets:
++        second_body += struct.pack("<I", off)
++    second_body += struct.pack("<I", num_sym)
++    for orig_idx, (member_idx, _) in sorted_syms:
++        second_body += struct.pack("<H", member_idx + 1)  # 1-based
++    second_body += second_strings
++
++    # Assemble
++    out = bytearray(ARCHIVE_MAGIC)
++
++    def _append_member(out, name, body):
++        hdr = _make_member_header(name, len(body))
++        out += hdr
++        out += body
++        if len(out) % 2:
++            out += b"\n"
++
++    _append_member(out, b"/", first_body)
++    _append_member(out, b"/", second_body)
++    if longnames_member:
++        _append_member(out, b"//", bytes(longnames_member["body"]))
++    for m in obj_members:
++        _append_member(out, m["name"], bytes(m["body"]))
++
++    return bytes(out)
++
++
++def _make_member_header(name, size):
++    """Build a 60-byte archive member header."""
++    hdr = bytearray(60)
++    hdr[0 : len(name)] = name
++    hdr[len(name) : 16] = b" " * (16 - len(name))
++    hdr[16:28] = b"0           "
++    hdr[28:34] = b"0     "
++    hdr[34:40] = b"0     "
++    hdr[40:48] = b"100666  "
++    size_s = str(size).encode()
++    hdr[48 : 48 + len(size_s)] = size_s
++    hdr[48 + len(size_s) : 58] = b" " * (10 - len(size_s))
++    hdr[58:60] = b"`\n"
++    return bytes(hdr)
++
++
++# ─── COFF object symbol handling ─────────────────────────────────────
++
++
++def _coff_get_external_symbols(obj_data):
++    """Get all external symbol names from a COFF object."""
++    if len(obj_data) < 20:
++        return []
++    sym_offset = struct.unpack_from("<I", obj_data, 8)[0]
++    num_syms = struct.unpack_from("<I", obj_data, 12)[0]
++    if sym_offset == 0 or num_syms == 0:
++        return []
++    strtab_offset = sym_offset + num_syms * 18
++    result = []
++    i = 0
++    while i < num_syms:
++        entry_off = sym_offset + i * 18
++        storage_class = obj_data[entry_off + 16]
++        num_aux = obj_data[entry_off + 17]
++        if storage_class == 2:  # IMAGE_SYM_CLASS_EXTERNAL
++            name = _coff_sym_name(obj_data, entry_off, strtab_offset)
++            if name:
++                result.append(name)
++        i += 1 + num_aux
++    return result
++
++
++def _coff_sym_name(obj_data, entry_off, strtab_offset):
++    """Read a symbol name from a COFF symbol table entry."""
++    name_field = obj_data[entry_off : entry_off + 8]
++    if name_field[:4] == b"\0\0\0\0":
++        str_off = struct.unpack_from("<I", name_field, 4)[0]
++        abs_off = strtab_offset + str_off
++        end = obj_data.index(b"\0", abs_off)
++        return obj_data[abs_off:end]
++    else:
++        return name_field.rstrip(b"\0")
++
++
++def _coff_rename_symbols(obj_data, renames):
++    """Rename symbols in a COFF object's string table.
++
++    renames: dict of {old_bytes: new_bytes}
++    Returns modified obj_data as bytearray.
++    """
++    obj = bytearray(obj_data)
++    if len(obj) < 20:
++        return obj
++    sym_offset = struct.unpack_from("<I", obj, 8)[0]
++    num_syms = struct.unpack_from("<I", obj, 12)[0]
++    if sym_offset == 0 or num_syms == 0:
++        return obj
++
++    strtab_offset = sym_offset + num_syms * 18
++    strtab_size = struct.unpack_from("<I", obj, strtab_offset)[0]
++    strtab_end = strtab_offset + strtab_size
++
++    # Build a map of offset → string for the string table.
++    # We'll rebuild the string table with renames applied.
++    strings = {}  # offset_in_strtab → bytes (including null)
++    pos = 4  # skip the 4-byte size field
++    while strtab_offset + pos < strtab_end:
++        abs_pos = strtab_offset + pos
++        try:
++            end = obj.index(b"\0", abs_pos)
++        except ValueError:
++            break
++        s = bytes(obj[abs_pos:end])
++        strings[pos] = s
++        pos = end - strtab_offset + 1
++
++    # Apply renames
++    new_strings = {}
++    for off, s in strings.items():
++        new_strings[off] = renames.get(s, s)
++
++    # Rebuild the string table
++    new_strtab = bytearray()
++    offset_map = {}  # old offset → new offset
++    cur = 4  # first string starts at offset 4
++    for old_off in sorted(strings.keys()):
++        offset_map[old_off] = cur
++        s = new_strings[old_off]
++        new_strtab += s + b"\0"
++        cur += len(s) + 1
++
++    new_strtab_with_size = struct.pack("<I", 4 + len(new_strtab)) + new_strtab
++
++    # Update symbol table entries' string offsets
++    i = 0
++    while i < num_syms:
++        entry_off = sym_offset + i * 18
++        num_aux = obj[entry_off + 17]
++        name_field = obj[entry_off : entry_off + 8]
++        if name_field[:4] == b"\0\0\0\0":
++            old_str_off = struct.unpack_from("<I", name_field, 4)[0]
++            if old_str_off in offset_map:
++                struct.pack_into("<I", obj, entry_off + 4, offset_map[old_str_off])
++        i += 1 + num_aux
++
++    # Replace the string table
++    obj[strtab_offset:strtab_end] = new_strtab_with_size
++
++    return obj
++
++
++# ─── public API ──────────────────────────────────────────────────────
++
++
++def redefine_symbols(lib_path, renames):
++    """Rename symbols in a COFF .lib file in-place.
++
++    renames: dict of {old_name_str: new_name_str}
++    """
++    renames_bytes = {k.encode(): v.encode() for k, v in renames.items()}
++
++    with open(lib_path, "rb") as f:
++        data = f.read()
++
++    members = _parse_archive(data)
++
++    # Rename in each obj member (skip linker members and longnames)
++    for i, m in enumerate(members):
++        if m["name"] in (b"/", b"//"):
++            continue
++        m["body"] = _coff_rename_symbols(m["body"], renames_bytes)
++
++    # Rebuild the archive (regenerates linker members with new symbol names)
++    new_data = _build_archive(members)
++
++    with open(lib_path, "wb") as f:
++        f.write(new_data)
++
++
++# ─── CLI ─────────────────────────────────────────────────────────────
++
++
++def main():
++    if len(sys.argv) < 3:
++        print(f"Usage: {sys.argv[0]} old=new [old2=new2 ...] file.lib", file=sys.stderr)
++        sys.exit(1)
++
++    lib_path = sys.argv[-1]
++    renames = {}
++    for arg in sys.argv[1:-1]:
++        if "=" not in arg:
++            print(f"ERROR: expected old=new, got: {arg}", file=sys.stderr)
++            sys.exit(1)
++        old, new = arg.split("=", 1)
++        renames[old] = new
++
++    redefine_symbols(lib_path, renames)
++    print(f"Renamed {len(renames)} symbol(s) in {lib_path}")
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/tools/link_napi_addons.py b/tools/link_napi_addons.py
 new file mode 100755
-index 00000000..a5afbb9d
+index 00000000..3bfefa9c
 --- /dev/null
 +++ b/tools/link_napi_addons.py
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,157 @@
 +#!/usr/bin/env python3
 +"""Generate linked-binding wrapper for statically-linked NAPI addons.
 +
 +For each addon specified as name:path, this script:
 +  1. Copies the .a/.lib to a staging directory
-+  2. Runs objcopy/llvm-objcopy --redefine-sym to give each addon unique symbols
++  2. Renames the standard napi_register_module_v1 symbol to a unique name
 +  3. Generates a C++ file that registers them as Node.js linked bindings
 +
 +Called by configure.py when --link-napi-addon is used.
 +
-+On Windows, llvm-objcopy from the Visual Studio LLVM toolchain is used.
-+On Linux/macOS, GNU objcopy (or llvm-objcopy if available) is used.
++On Linux/macOS, GNU objcopy is used for symbol renaming.
++On Windows, a pure-Python COFF .lib rewriter is used (coff_redefine_sym.py).
 +"""
 +
 +import argparse
@@ -133,43 +445,36 @@ index 00000000..a5afbb9d
 +import sys
 +
 +
-+def _find_objcopy():
-+    """Find an objcopy binary that supports --redefine-sym."""
-+    is_win = platform.system() == "Windows"
++def _redefine_symbols(lib_path, renames, is_win):
++    """Rename symbols in a static library.
 +
++    renames: dict of {old_name: new_name}
++    """
 +    if is_win:
-+        # Node.js v24+ requires ClangCL, so LLVM is always installed.
-+        # llvm-objcopy is in the same directory as clang-cl.exe.
-+        # Check VCINSTALLDIR first (set by vcvarsall.bat / vcbuild.bat).
-+        vcinstalldir = os.environ.get("VCINSTALLDIR", "")
-+        if vcinstalldir:
-+            candidate = os.path.join(vcinstalldir, "Tools", "Llvm", "x64", "bin", "llvm-objcopy.exe")
-+            if os.path.isfile(candidate):
-+                return candidate
++        # Use our pure-Python COFF .lib rewriter
++        tools_dir = os.path.dirname(os.path.abspath(__file__))
++        sys.path.insert(0, tools_dir)
++        import coff_redefine_sym
 +
-+        # Fallback: try PATH
-+        for name in ("llvm-objcopy", "llvm-objcopy.exe"):
-+            path = shutil.which(name)
-+            if path:
-+                return path
-+
-+        print(
-+            "ERROR: llvm-objcopy not found. Install Visual Studio with the C++ Clang tools, or add llvm-objcopy to PATH.",
-+            file=sys.stderr,
-+        )
-+        sys.exit(1)
++        coff_redefine_sym.redefine_symbols(lib_path, renames)
++        print(f"  Renamed symbols (Python COFF rewriter): {lib_path}", file=sys.stderr)
 +    else:
-+        # Linux / macOS: prefer objcopy, fall back to llvm-objcopy
++        # Use GNU objcopy / llvm-objcopy
++        objcopy = None
 +        for name in ("objcopy", "llvm-objcopy"):
-+            path = shutil.which(name)
-+            if path:
-+                return path
++            objcopy = shutil.which(name)
++            if objcopy:
++                break
++        if not objcopy:
++            print("ERROR: neither objcopy nor llvm-objcopy found. Install binutils or llvm.", file=sys.stderr)
++            sys.exit(1)
 +
-+        print(
-+            "ERROR: neither objcopy nor llvm-objcopy found. Install binutils or llvm.",
-+            file=sys.stderr,
-+        )
-+        sys.exit(1)
++        cmd = [objcopy]
++        for old, new in renames.items():
++            cmd += ["--redefine-sym", f"{old}={new}"]
++        cmd.append(lib_path)
++        subprocess.check_call(cmd)
++        print(f"  Renamed symbols ({objcopy}): {lib_path}", file=sys.stderr)
 +
 +
 +def main():
@@ -182,27 +487,18 @@ index 00000000..a5afbb9d
 +    os.makedirs(output_dir, exist_ok=True)
 +
 +    is_win = platform.system() == "Windows"
-+    objcopy = _find_objcopy()
-+    print(f"Using objcopy: {objcopy}", file=sys.stderr)
 +
 +    addons = []
 +    for spec in args.addons:
 +        # Format: name:/path/to/lib.a  or  name:C:\path\to\lib.lib
-+        # split(":", 1) gives ["name", "/path/..."] or ["name", "C:\path\..."].
-+        # On Windows the path part may start with a drive letter like "C:\",
-+        # which itself contains ":". Handle this: if the path part is a single
-+        # letter followed by ":\", rejoin with the next split.
++        # split(":", 1) works because addon names are valid C identifiers
++        # (always more than 1 char), so they can't be confused with a
++        # single-letter Windows drive prefix.
 +        parts = spec.split(":", 1)
 +        if len(parts) != 2 or not parts[0]:
 +            print(f"ERROR: expected name:/path, got: {spec}", file=sys.stderr)
 +            sys.exit(1)
 +        name, path = parts
-+        # Check if we accidentally split a Windows drive letter:
-+        # name="simple_napi", path="C" won't happen since split(":", 1) yields
-+        # the full remainder. But if name itself looks like a single drive
-+        # letter (e.g. spec="C:\foo"), that means no name was provided.
-+        # In practice addon names must be valid C identifiers (len > 1), so
-+        # a single-char name that equals a drive letter is rejected.
 +        if len(name) == 1 and name.isalpha() and path.startswith(("\\", "/")):
 +            print(f"ERROR: addon name cannot be a single letter (conflicts with drive letters): {spec}", file=sys.stderr)
 +            sys.exit(1)
@@ -217,15 +513,13 @@ index 00000000..a5afbb9d
 +        ext = ".lib" if is_win else ".a"
 +        dst = os.path.join(output_dir, f"lib_napi_{name}{ext}")
 +        shutil.copy2(src, dst)
-+        subprocess.check_call(
-+            [
-+                objcopy,
-+                "--redefine-sym",
-+                f"napi_register_module_v1=napi_register_module_v1__{name}",
-+                "--redefine-sym",
-+                f"node_api_module_get_api_version_v1=node_api_module_get_api_version_v1__{name}",
-+                dst,
-+            ]
++        _redefine_symbols(
++            dst,
++            {
++                "napi_register_module_v1": f"napi_register_module_v1__{name}",
++                "node_api_module_get_api_version_v1": f"node_api_module_get_api_version_v1__{name}",
++            },
++            is_win,
 +        )
 +        lib_paths.append(dst)
 +

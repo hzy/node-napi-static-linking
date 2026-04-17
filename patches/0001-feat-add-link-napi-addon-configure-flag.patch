@@ -1,4 +1,4 @@
-From a5bc1176f4cedca8d8f2c767df2d9ad1f826da35 Mon Sep 17 00:00:00 2001
+From e2581dc4fef995cab983b007f2a9ed7cfeb4fbb1 Mon Sep 17 00:00:00 2001
 From: Zhiyuan Hong <hongzhiyuan.hzy@bytedance.com>
 Date: Thu, 16 Apr 2026 14:58:02 +0800
 Subject: [PATCH] feat: add --link-napi-addon configure flag
@@ -22,9 +22,9 @@ Changes:
 ---
  configure.py               |  29 ++++
  node.gyp                   |   7 +
- tools/coff_redefine_sym.py | 304 +++++++++++++++++++++++++++++++++++++
+ tools/coff_redefine_sym.py | 313 +++++++++++++++++++++++++++++++++++++
  tools/link_napi_addons.py  | 157 +++++++++++++++++++
- 4 files changed, 497 insertions(+)
+ 4 files changed, 506 insertions(+)
  create mode 100644 tools/coff_redefine_sym.py
  create mode 100755 tools/link_napi_addons.py
 
@@ -109,10 +109,10 @@ index bd77943b..f079d59a 100644
          'deps/postject/postject-api.h',
 diff --git a/tools/coff_redefine_sym.py b/tools/coff_redefine_sym.py
 new file mode 100644
-index 00000000..576feb5b
+index 00000000..04eb1e54
 --- /dev/null
 +++ b/tools/coff_redefine_sym.py
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,313 @@
 +#!/usr/bin/env python3
 +"""Rename symbols in a COFF static library (.lib) file.
 +
@@ -273,6 +273,8 @@ index 00000000..576feb5b
 +    if sym_offset == 0 or num_syms == 0:
 +        return []
 +    strtab_offset = sym_offset + num_syms * 18
++    if strtab_offset + 4 > len(obj_data):
++        return []  # not a standard COFF object
 +    result = []
 +    i = 0
 +    while i < num_syms:
@@ -314,7 +316,14 @@ index 00000000..576feb5b
 +        return obj
 +
 +    strtab_offset = sym_offset + num_syms * 18
++    # Sanity check: the symbol table and string table must fit within the
++    # object data.  If they don't, this is not a standard COFF object
++    # (e.g. it could be an import library member or LTCG bitcode).  Skip it.
++    if strtab_offset + 4 > len(obj):
++        return obj
 +    strtab_size = struct.unpack_from("<I", obj, strtab_offset)[0]
++    if strtab_offset + strtab_size > len(obj):
++        return obj
 +    strtab_end = strtab_offset + strtab_size
 +
 +    # Build a map of offset → string for the string table.

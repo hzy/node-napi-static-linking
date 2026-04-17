@@ -19,7 +19,12 @@
       ],
       "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
       "cflags!": ["-fno-exceptions"],
-      "cflags_cc!": ["-fno-exceptions"]
+      "cflags_cc!": ["-fno-exceptions"],
+      "msvs_settings": {
+        "VCCLCompilerTool": {
+          "WholeProgramOptimization": "false"
+        }
+      }
     }
   ]
 }
